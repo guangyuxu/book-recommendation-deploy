@@ -1,0 +1,240 @@
+# Full-stack bundle for the book-recommendation platform.
+#
+#   postgres + redis  (bundled data stores)
+#   accounts          (IdP + family/child CRUD)   container :8000  -> host :8001
+#   agent             (LangGraph Server)           container :2024  -> host :2024  (LangGraph port)
+#   service           (BFF / chat proxy)           container :8000  -> host :8000
+#   ui                (nginx: serves the SPA only)                  -> host :8080
+#
+# UI wiring = DIRECT: the browser calls the backends by absolute URL (accounts http://localhost:8001,
+# service http://localhost:8000), which are CORS-enabled for the UI origin. No reverse proxy. The
+# service (BFF) remains the auth boundary — the browser never talks to the agent directly. RS256
+# keys are generated once into the `jwt-keys` volume by the one-shot `keygen` service and shared
+# (private+public to accounts, public to service).
+#
+# Usage:
+#   cp .env.example .env      # fill in ANTHROPIC_API_KEY, LANGSMITH_API_KEY, etc.
+#   docker compose up --build
+#   open http://localhost:8080
+#
+# Build contexts point at the sibling app repos (../book-recommendation-*).
+
+x-app-env: &app-env
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:?set ANTHROPIC_API_KEY in .env}
+  ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-}
+
+services:
+  # ---------------------------------------------------------------- data stores
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-book}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-book}
+      POSTGRES_DB: ${POSTGRES_DB:-book}
+    volumes:
+      # postgres:18+ stores data in a version-specific subdir; the mount must be the parent dir
+      # (/var/lib/postgresql), NOT /var/lib/postgresql/data (that path errors on 18+).
+      - pgdata:/var/lib/postgresql
+      # Runs once on first init: creates the `langgraph` DB and the `accounts` + `book_agent` schemas.
+      - ./postgres/initdb:/docker-entrypoint-initdb.d:ro
+    ports:
+      # DEV: exposed for debugging (psql from host). DEBUG_BIND=127.0.0.1 restricts it to this
+      # machine; drop this mapping entirely in a locked-down deploy.
+      - "${DEBUG_BIND:-0.0.0.0}:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-book} -d ${POSTGRES_DB:-book}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------- one-shot init
+  # Generate the RS256 keypair once into the shared volume (idempotent; skips if present).
+  keygen:
+    image: alpine:3.20
+    volumes:
+      - jwt-keys:/keys
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        if [ ! -f /keys/private.pem ]; then
+          apk add --no-cache openssl >/dev/null
+          # genpkey outputs PKCS#8 by default; the -pkcs8 flag is not portable (alpine openssl 3.x rejects it).
+          openssl genpkey -algorithm RSA -out /keys/private.pem -pkeyopt rsa_keygen_bits:2048
+          openssl rsa -in /keys/private.pem -pubout -out /keys/public.pem
+          chmod 600 /keys/private.pem
+          echo "keygen: wrote /keys/private.pem + /keys/public.pem"
+        else
+          echo "keygen: keys already present, leaving untouched"
+        fi
+    restart: "no"
+
+  # Create the accounts schema + tables (models are the source of truth).
+  accounts-init:
+    image: book-recommendation-accounts:latest
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-book}:${POSTGRES_PASSWORD:-book}@postgres:5432/${POSTGRES_DB:-book}?options=-csearch_path%3Daccounts
+    command: ["uv", "run", "--no-dev", "python", "-c", "from accounts.db import init_db; init_db()"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  # Create the agent's domain schema (book_agent) + tables.
+  # The langgraph-api image has its own ENTRYPOINT (starts the server) and excludes scripts/, so we
+  # override the entrypoint and call agent.db.init_db() directly (what scripts/create_tables.py does).
+  agent-init:
+    image: book-recommendation-agent:latest
+    environment:
+      BOOK_AGENT_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-book}:${POSTGRES_PASSWORD:-book}@postgres:5432/${POSTGRES_DB:-book}?options=-csearch_path%3Dbook_agent
+    entrypoint: ["python", "-c", "from agent.db import init_db; init_db()"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  # ---------------------------------------------------------------- apps
+  accounts:
+    build:
+      context: ../book-recommendation-accounts
+    image: book-recommendation-accounts:latest
+    ports:
+      - "8001:8000" # accounts listens on 8000 in-container; published on host 8001 (direct URLs, no proxy)
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-book}:${POSTGRES_PASSWORD:-book}@postgres:5432/${POSTGRES_DB:-book}?options=-csearch_path%3Daccounts
+      JWT_PRIVATE_KEY_PATH: /keys/private.pem
+      JWT_PUBLIC_KEY_PATH: /keys/public.pem
+      JWT_ISSUER: book-recommendation-accounts
+      JWT_AUDIENCE: book-recommendation
+      ACCOUNTS_SERVICE_TOKEN: ${ACCOUNTS_SERVICE_TOKEN:?set ACCOUNTS_SERVICE_TOKEN in .env}
+      # Local HTTP (dev default false): the refresh cookie must not be Secure or the browser drops
+      # it over plain http. Set REFRESH_COOKIE_SECURE=true once TLS terminates in front.
+      REFRESH_COOKIE_SECURE: "${REFRESH_COOKIE_SECURE:-false}"
+      # The browser calls accounts cross-origin from the UI, so it must be in the CORS allowlist.
+      # (8080 = the compose UI; 5173 = `npm run dev`.)
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8080,http://localhost:5173}
+    volumes:
+      - jwt-keys:/keys:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      keygen:
+        condition: service_completed_successfully
+      accounts-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/healthz').getcode()==200 else 1)\""]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  agent:
+    build:
+      context: ../book-recommendation-agent
+    image: book-recommendation-agent:latest
+    # The LangGraph agent listens on 2024 (its conventional port) everywhere: app, container, and
+    # host mapping. DEV ONLY exposure for debugging (Swagger at http://localhost:2024/docs, plus the
+    # custom /internal + A2A routes). In production the agent must NOT be reachable from outside —
+    # only the service (BFF) talks to it over the internal network. DEBUG_BIND=127.0.0.1 restricts
+    # it to this machine; drop this mapping entirely for any non-dev deploy.
+    ports:
+      - "${DEBUG_BIND:-0.0.0.0}:2024:2024"
+    environment:
+      <<: *app-env
+      # Make the LangGraph server bind 2024 in-container (entrypoint honors LANGGRAPH_SERVER_PORT).
+      LANGGRAPH_SERVER_PORT: "2024"
+      # Mount the agent's custom HTTP app (webapp.py: /internal/* + curated A2A card). The server
+      # reads this from env at runtime, not from langgraph.json — the hand-built image bakes only
+      # LANGSERVE_GRAPHS, so without this the custom routes 404.
+      LANGGRAPH_HTTP: '{"app": "agent.webapp:app"}'
+      DATABASE_URI: postgres://${POSTGRES_USER:-book}:${POSTGRES_PASSWORD:-book}@postgres:5432/langgraph?sslmode=disable
+      REDIS_URI: redis://redis:6379
+      BOOK_AGENT_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-book}:${POSTGRES_PASSWORD:-book}@postgres:5432/${POSTGRES_DB:-book}?options=-csearch_path%3Dbook_agent
+      ACCOUNTS_INTERNAL_URL: http://accounts:8000
+      ACCOUNTS_SERVICE_TOKEN: ${ACCOUNTS_SERVICE_TOKEN:?set ACCOUNTS_SERVICE_TOKEN in .env}
+      # LangGraph Server (licensed image) — supply a license or a LangSmith key with the right plan.
+      LANGGRAPH_CLOUD_LICENSE_KEY: ${LANGGRAPH_CLOUD_LICENSE_KEY:-}
+      LANGSMITH_API_KEY: ${LANGSMITH_API_KEY:-}
+      LANGSMITH_TRACING: ${LANGSMITH_TRACING:-false}
+      LANGSMITH_ENDPOINT: ${LANGSMITH_ENDPOINT:-}
+      LANGSMITH_PROJECT: ${LANGSMITH_PROJECT:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      agent-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:2024/ok').getcode()==200 else 1)\""]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+    restart: unless-stopped
+
+  service:
+    build:
+      context: ../book-recommendation-service
+    image: book-recommendation-service:latest
+    ports:
+      - "8000:8000" # the browser calls the BFF directly for chat (SSE) — direct URLs, no proxy
+    environment:
+      # 0 = enforce real JWT (dev default — accounts issues tokens locally). 1 = bypass auth.
+      DEV_AUTH: "${DEV_AUTH:-0}"
+      JWT_PUBLIC_KEY_PATH: /keys/public.pem
+      JWT_ISSUER: book-recommendation-accounts
+      JWT_AUDIENCE: book-recommendation
+      AGENT_URL: http://agent:2024
+      AGENT_GRAPH_NAME: agent
+      ACCOUNTS_URL: http://accounts:8000
+      # The browser calls the BFF cross-origin from the UI, so it must be in the CORS allowlist.
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8080,http://localhost:5173}
+    volumes:
+      - jwt-keys:/keys:ro
+    depends_on:
+      keygen:
+        condition: service_completed_successfully
+      accounts:
+        condition: service_healthy
+      agent:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/healthz').getcode()==200 else 1)\""]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  ui:
+    build:
+      context: ../book-recommendation-ui
+    image: book-recommendation-ui:latest
+    ports:
+      - "${UI_PORT:-8080}:80"
+    depends_on:
+      accounts:
+        condition: service_healthy
+      service:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  jwt-keys:

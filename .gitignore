@@ -1,0 +1,10 @@
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
+.idea
+.vscode
+# Generated keys must never be committed.
+keys/
+*.pem

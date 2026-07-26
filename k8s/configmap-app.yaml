@@ -1,0 +1,49 @@
+# Non-secret configuration shared across the apps. Secrets (LLM keys, ACCOUNTS_SERVICE_TOKEN) live
+# in the `app-secrets` Secret (created by `make k8s-secrets` from your .env); the RS256 PEMs live in
+# the `jwt-keys` Secret (created by `make k8s-keys`).
+#
+# The bundled Postgres uses the fixed dev credentials book/book below; to change them, edit BOTH the
+# POSTGRES_* values AND the embedded DSNs, or move the DSNs into a Secret.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: book-rec
+data:
+  # Postgres (bundled)
+  POSTGRES_USER: book
+  POSTGRES_PASSWORD: book
+  POSTGRES_DB: book
+
+  # Connection strings (embed the bundled dev credentials)
+  DATABASE_URL: "postgresql+psycopg://book:book@postgres:5432/book?options=-csearch_path%3Daccounts"
+  BOOK_AGENT_DATABASE_URL: "postgresql+psycopg://book:book@postgres:5432/book?options=-csearch_path%3Dbook_agent"
+  DATABASE_URI: "postgres://book:book@postgres:5432/langgraph?sslmode=disable"
+  REDIS_URI: "redis://redis:6379"
+
+  # Auth / claims contract
+  JWT_ISSUER: book-recommendation-accounts
+  JWT_AUDIENCE: book-recommendation
+  JWT_PRIVATE_KEY_PATH: /keys/private.pem
+  JWT_PUBLIC_KEY_PATH: /keys/public.pem
+  DEV_AUTH: "0"
+  # Behind an ingress without TLS the refresh cookie can't be Secure; set true once TLS terminates.
+  REFRESH_COOKIE_SECURE: "false"
+
+  # Make the LangGraph server bind 2024 in-container (its conventional port).
+  LANGGRAPH_SERVER_PORT: "2024"
+  # Mount the agent's custom HTTP app (webapp.py: /internal/* + curated A2A card). The image bakes
+  # only LANGSERVE_GRAPHS, so without this the custom routes 404 and the built-in A2A card leaks the
+  # state schema. Must match the compose LANGGRAPH_HTTP value.
+  LANGGRAPH_HTTP: '{"app": "agent.webapp:app"}'
+
+  # Inter-service URLs (Kubernetes Service DNS within the namespace)
+  AGENT_URL: http://agent:2024
+  AGENT_GRAPH_NAME: agent
+  ACCOUNTS_URL: http://accounts:8000
+  ACCOUNTS_INTERNAL_URL: http://accounts:8000
+
+  # CORS (same-origin via the UI ingress; keep the public origin for safety)
+  CORS_ORIGINS: http://localhost:8080
+  LANGSMITH_TRACING: "false"
+  LANGSMITH_PROJECT: book-recommendation

@@ -1,0 +1,82 @@
+# Bundled Postgres: one instance, three logical stores (accounts schema, book_agent schema, and the
+# langgraph database). The init SQL runs once on first pod init from the ConfigMap below.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-initdb
+  namespace: book-rec
+data:
+  01-init.sql: |
+    SELECT 'CREATE DATABASE langgraph'
+    WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'langgraph')\gexec
+
+    \connect book
+    CREATE SCHEMA IF NOT EXISTS accounts;
+    CREATE SCHEMA IF NOT EXISTS book_agent;
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: book-rec
+spec:
+  clusterIP: None
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: book-rec
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:18
+          envFrom:
+            - configMapRef:
+                name: app-config
+          ports:
+            - containerPort: 5432
+          volumeMounts:
+            - name: pgdata
+              # postgres:18+ needs the parent dir mounted, not /var/lib/postgresql/data.
+              mountPath: /var/lib/postgresql
+            - name: initdb
+              mountPath: /docker-entrypoint-initdb.d
+              readOnly: true
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U $POSTGRES_USER -d $POSTGRES_DB"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U $POSTGRES_USER -d $POSTGRES_DB"]
+            initialDelaySeconds: 20
+            periodSeconds: 20
+      volumes:
+        - name: initdb
+          configMap:
+            name: postgres-initdb
+  volumeClaimTemplates:
+    - metadata:
+        name: pgdata
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 5Gi
