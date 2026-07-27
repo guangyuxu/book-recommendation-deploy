@@ -70,6 +70,51 @@ Add `book-rec.local` to `/etc/hosts` (pointing at the ingress IP), or port-forwa
 Schema/table creation runs as init containers on the accounts and agent Deployments (idempotent);
 the LangGraph Server self-migrates the `langgraph` database on startup.
 
+## Build & verification
+
+The **Makefile is the single source of truth**: `.github/workflows/ci.yml` and
+`.pre-commit-config.yaml` only call these targets, never restate the commands, so local and CI
+cannot drift. See the VERIFICATION MAP at the top of the `Makefile`.
+
+This repo has no code, so there is nothing to lint or unit-test — `ci` validates the **manifests**:
+
+| Command | What it does |
+| --- | --- |
+| `make check` | **Everyday gate** after a manifest change: `compose_check` + `k8s_check` (offline, no cluster) |
+| `make ci` | **What GitHub Actions runs verbatim** — identical to `check` here |
+| `make compose_check` | `docker compose --env-file .env.example config -q` — renders the merged compose file |
+| `make k8s_check` | `kubectl kustomize k8s` — renders the full overlay locally |
+| `make k8s-diff` | server-side diff against the **current cluster** — schema-aware, so kept out of `ci` |
+
+Both checks are pure renders: they parse every file, resolve every variable and patch reference, and
+fail on a typo'd key, an unresolvable `${VAR}`, or a kustomization pointing at a file that no longer
+exists. `make help` lists every target.
+
+Two things worth knowing:
+
+- **`compose_check` deliberately ignores your real `.env`** and feeds `.env.example` plus dummy
+  values for the two required (`${VAR:?}`) secrets. A real `.env` would make the check pass for the
+  wrong reason and hide a variable nobody documented. If you add a third required variable, teach
+  that target about it.
+- **`kubectl apply -k --dry-run=client` is not an offline check** — despite the name it downloads the
+  OpenAPI schema from the API server and fails with `connection refused` where no cluster is
+  reachable. That is why `k8s_check` uses `kubectl kustomize`, and why schema validation lives in
+  `make k8s-diff`. (The old `k8s-validate` target claimed to be client-side but needed a cluster;
+  it has been replaced by these two.)
+
+`make ci` does **not** build images — the compose build contexts point at the sibling repos, which
+are absent when this repo is checked out alone, and each app repo's CI already builds its own image.
+CI also runs a **gitleaks** secret scan, which matters most here: this is where `.env` files, RS256
+keypairs and service tokens are handled. Install the same hook locally:
+
+```bash
+pipx install pre-commit && pre-commit install   # make check on commit, make ci on push, + gitleaks
+```
+
+Base-image tags (`postgres`, `redis`, `alpine`) are watched by Dependabot in **both**
+`docker-compose.yml` and `k8s/` — see `.github/dependabot.yml`. Expect two PRs for one image bump
+and apply them together; a skew between compose and k8s is a bug.
+
 ## Configuration notes
 
 - **DB credentials**: the bundle uses `book/book` by default. Compose reads them from `.env`
@@ -86,7 +131,14 @@ the LangGraph Server self-migrates the `langgraph` database on startup.
 ```
 docker-compose.yml            # full stack (compose)
 postgres/initdb/01-init.sql   # first-init: langgraph db + accounts/book_agent schemas
-.env.example                  # secrets + bundle config
-Makefile                      # up/down/logs + k8s-keys/k8s-secrets/k8s-apply
+.env.example                  # secrets + bundle config (documentation, never real values)
+Makefile                      # THE source of truth for checks: check/ci + up/down/logs + k8s-*
+CLAUDE.md                     # architecture invariants, secret rules, change-coupling rules
 k8s/                          # namespace, config, postgres, redis, apps, ingress, kustomization
+.github/workflows/ci.yml      # make ci + gitleaks
+.github/dependabot.yml        # base-image tags (compose + k8s) and GitHub Actions
 ```
+
+> **Change coupling:** ports, environment variables and image tags are each pinned in several files
+> at once (compose, `k8s/*.yaml`, `.env.example`, app READMEs). Changing one and not the others
+> yields a stack that starts and then misbehaves. `CLAUDE.md` lists what must move together.

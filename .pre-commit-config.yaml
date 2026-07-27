@@ -1,0 +1,50 @@
+# Local git hooks.
+#
+# The make-* hooks are each a SINGLE make target — no tool commands are restated here, so the
+# Makefile CHECKS section stays the one source of truth and they cannot drift from CI:
+#   pre-commit (every commit) -> `make check`  — render/validate compose + the kustomize overlay.
+#   pre-push   (before push)  -> `make ci`     — identical here; this repo has no code to test, so
+#                                               there is no slower superset to save for push time.
+# Both are offline and need no cluster. (`make ci` being the same as `make check` is not an
+# oversight — see the VERIFICATION MAP in the Makefile.)
+#
+# gitleaks is the ONE exception: it is not a make target but its own pinned repo. In this repo it is
+# also the most important hook by far — this is where .env files, RS256 keypairs and service tokens
+# get handled, so it is the likeliest place to leak a credential. .gitignore blocks .env / keys/ /
+# *.pem, but only for paths someone already thought of; this scans the content of whatever is
+# actually staged.
+#
+# WHERE pre-commit ITSELF COMES FROM: the Python siblings get it via `uv run pre-commit`; this repo
+# has no Python project, so install it once, globally, outside the repo:
+#   pipx install pre-commit     (or `brew install pre-commit`)
+# One-time setup (installs BOTH make hook types thanks to default_install_hook_types):
+#   pre-commit install
+# Run manually: `pre-commit run --all-files` (check) / add `--hook-stage pre-push` for ci.
+default_install_hook_types: [pre-commit, pre-push]
+
+repos:
+  - repo: local
+    hooks:
+      - id: make-check
+        name: make check (compose + kustomize render)
+        entry: make check
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit]
+
+      - id: make-ci
+        name: make ci (same as check; this repo has no code)
+        entry: make ci
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
+
+  # Secret scanning — blocks commits that would leak credentials/keys. Feature-complete tool
+  # pinned to a release; refresh with `pre-commit autoupdate`. Same rev as the four sibling repos —
+  # bump them together.
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.24.2
+    hooks:
+      - id: gitleaks

@@ -1,0 +1,84 @@
+# CI: two parallel jobs.
+#   checks  — runs `make ci` (render + validate the compose file and the kustomize overlay): the
+#             SAME command you run locally, the single ground truth. Only infrastructure that make
+#             cannot own lives here (installing kubectl); every actual check lives in the Makefile
+#             CHECKS section, so CI and local cannot drift.
+#   secrets — gitleaks secret scan. This repo needs it MORE than any sibling: it is where .env
+#             files, RS256 keys and service tokens are handled, so it is the likeliest place for a
+#             credential to be committed by accident. .gitignore already blocks .env / keys/ /
+#             *.pem, but .gitignore is opt-in-per-path and only helps for paths someone thought of;
+#             this is the server-side backstop that does not depend on remembering.
+#
+# There is deliberately no `docker` job and no image build: the compose build contexts point at the
+# SIBLING repos (../book-recommendation-*), which do not exist when this repo is checked out alone.
+# Each app repo's own ci.yml already has a `docker` job for its own image.
+#
+# There is also no audit.yml: this repo pins no dependency manifest (no package.json, no uv.lock),
+# so there is nothing for pip-audit/npm audit to scan. Base-image tags are watched by Dependabot's
+# `docker` ecosystem instead (see .github/dependabot.yml).
+
+name: CI
+
+on:
+  push:
+    branches: ["master", "dev"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Cancel earlier runs on the same branch/PR when a new push arrives.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── 1. Checks (== `make ci`) ─────────────────────────────────────────────────
+  # Runs straight on the runner: no container (nothing to isolate -- this repo has no dependencies
+  # to install) and no `services:` block (both checks are pure local renders; neither connects to a
+  # database or a cluster).
+  checks:
+    name: Checks (make ci)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # `docker compose` ships with the runner image, but kubectl is pinned explicitly: the
+      # kustomize version that renders the overlay is EMBEDDED in kubectl, so leaving it to
+      # whatever the runner image happens to carry would let the render change under us.
+      # v1.36.3 carries kustomize v5.8.1 — keep this in step with the version developers run, since
+      # that is the render `make k8s_check` was verified against. Dependabot bumps the action, not
+      # this pin; raise it deliberately after re-running `make check` locally.
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: v1.36.3
+
+      # THE ground truth: byte-for-byte the same command developers run locally.
+      # It reads .env.example (never a real .env, which does not exist here) and needs no cluster --
+      # see the compose_check / k8s_check comments in the Makefile for why each is shaped that way.
+      - name: make ci
+        run: make ci
+
+  # ── 2. Secret scan ───────────────────────────────────────────────────────────
+  # Server-side backstop for the gitleaks pre-commit hook: catches secrets even if a contributor
+  # never ran `pre-commit install`. fetch-depth: 0 so it scans full history on push.
+  # NOTE: gitleaks-action is free for public repos; a private org needs GITLEAKS_LICENSE in env.
+  # The scan step is skipped for Dependabot PRs: their GITHUB_TOKEN is read-only and has no access
+  # to repo secrets, so gitleaks-action errors out, and a version-only bump cannot introduce a
+  # secret anyway. The job itself still runs (reports green, satisfying a required check); the
+  # full-history scan on push to master remains the real backstop.
+  secrets:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: gitleaks
+        if: github.actor != 'dependabot[bot]'
+        uses: gitleaks/gitleaks-action@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

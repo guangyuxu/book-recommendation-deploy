@@ -1,0 +1,56 @@
+version: 2
+
+# This repo pins no dependency manifest (no package.json, no uv.lock), so unlike the four app repos
+# there is no language ecosystem here. What it DOES pin is base-image tags -- in docker-compose.yml
+# and in the k8s Deployments -- and those are exactly the versions that silently rot. Watching them
+# is the whole value of Dependabot in this repo.
+#
+# Three ecosystems, because Dependabot draws the lines in a non-obvious place:
+#   - `docker-compose` reads docker-compose.yml.
+#   - `docker` reads Dockerfiles AND Kubernetes Deployment YAML -- but it does NOT auto-discover
+#     YAML anywhere in the repo. Every directory holding manifests must be listed explicitly, hence
+#     `directory: /k8s`. (There is no "kubernetes" ecosystem.)
+#   - `github-actions` reads .github/workflows.
+#
+# The same image therefore gets watched twice (compose and k8s both pin postgres:18 / redis:7-alpine)
+# and will open two PRs. That is deliberate: the two files are independent deployment targets, and a
+# version skew between them is a bug, so seeing both bumps is the point. Apply them together.
+updates:
+  # Compose stack base images: postgres, redis, alpine (the keygen one-shot).
+  - package-ecosystem: docker-compose
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      # The bundled data stores move together -- the compose file and the k8s manifests must agree
+      # on them, and a Postgres major is a data-migration event, never a routine bump.
+      stores:
+        patterns: ["postgres", "redis"]
+    ignore:
+      # The four app images are built from the sibling repos and tagged `:latest` locally -- they are
+      # never pulled from a registry, so there is no "newer version" for Dependabot to find.
+      - dependency-name: "book-recommendation-*"
+
+  # Kubernetes Deployment manifests. Must be listed by directory: the docker ecosystem does not
+  # search for k8s YAML on its own.
+  - package-ecosystem: docker
+    directory: /k8s
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      stores:
+        patterns: ["postgres", "redis"]
+    ignore:
+      - dependency-name: "book-recommendation-*"
+
+  # GitHub Actions
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
