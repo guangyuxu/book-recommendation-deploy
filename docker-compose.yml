@@ -61,7 +61,7 @@ services:
   # ---------------------------------------------------------------- one-shot init
   # Generate the RS256 keypair once into the shared volume (idempotent; skips if present).
   keygen:
-    image: alpine:3.20
+    image: alpine:3.24
     volumes:
       - jwt-keys:/keys
     command:
